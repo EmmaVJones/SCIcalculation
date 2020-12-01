@@ -1,0 +1,94 @@
+---
+title: "Parameterized Station Query ODS_test"
+output: html_document
+params:
+  StationID: '1AGOO011.23'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+library(DBI)
+library(tidyverse)
+library(config)
+library(mapview)
+library(sf)
+library(measurements) # just for DMS to DD conversion, pretty annoying to stored coordinates in 6 columns
+library(DT)
+
+# establish db connection locally
+#con <- DBI::dbConnect(odbc::odbc(),
+#  Driver = "SQL Server",  # note the space between SQL and Server ( how MS named driver)
+#  Server= "WSQ04151,50000",
+#  Database = "ODS_test" )
+
+# establish db connection on server. Need to enter credentials safely on server after upload
+con <- DBI::dbConnect(odbc::odbc(),
+  Driver = "SQLServer",   # note the LACK OF space between SQL and Server ( how RStudio named driver)
+  Server= "WSQ04151,50000",
+  Database = "ODS_test",
+  UID = Sys.getenv("userid"),
+  PWD = Sys.getenv("pwd") )
+
+```
+
+
+pull test data 
+
+```{r}
+datatable(
+  dbGetQuery(con, paste0("SELECT * FROM ODS_test.dbo.WQM_Stations_View WHERE Sta_ID = '", params$StationID,"'")),
+  rownames = F, escape = F, options = list(scrollX = TRUE))
+
+```
+pull with SQL. Can't figure out how to use params for variable so ended up creating sendToSQL object and saving params variable to that
+```{r}
+#sendToSQL <- '2-JKS023.61'
+sendToSQL <- params$StationID
+```
+
+
+```{sql, connection=con}
+select * from WQM_Stations_View where Sta_ID = ?sendToSQL;
+```
+
+pull using dplyr/dbplyr. Same story where needed to make params variable a local object before I could successfully pass to piped statement 
+
+```{r}
+#tbl(con, "WQM_Stations_View") %>%
+#  filter(Sta_Id %in% {params$StationID}) %>% # did not like inserting params$StationID or {params$StationID} or ?params$StationID
+#  as_tibble() 
+
+datatable(
+  tbl(con, "WQM_Stations_View") %>% 
+    filter(Sta_Id %in% sendToSQL) %>%
+    as_tibble(),
+  rownames = F, escape = F, options = list(scrollX = TRUE))
+
+```
+
+And a map just for funzies.
+
+```{r}
+tbl(con, "WQM_Stations_View") %>% 
+  filter(Sta_Id %in% sendToSQL) %>%
+  as_tibble() %>%
+  ## make DMS to DD conversion
+  mutate(latDMS = paste(Sta_Lat_Deg, Sta_Lat_Min, Sta_Lat_Sec),
+         lngDMS = paste(Sta_Long_Deg, Sta_Long_Min, Sta_Long_Sec),
+         latDD = as.numeric(measurements::conv_unit(latDMS, from = 'deg_min_sec', to = 'dec_deg')),
+         lngDD = as.numeric(measurements::conv_unit(lngDMS, from = 'deg_min_sec', to = 'dec_deg')) ) %>%
+  st_as_sf(coords = c("lngDD", "latDD"),  # make spatial layer using these columns
+           remove = F, # don't remove these lat/lon cols from df
+           crs = 4326) %>%
+  mapview()
+```
+
+
+
+
+
+```{r}
+dbDisconnect(con)
+```
+

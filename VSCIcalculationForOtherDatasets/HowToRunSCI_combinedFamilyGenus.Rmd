@@ -1,0 +1,514 @@
+---
+title: "How To Run the VSCI0- Combined Family and Genus Database Version"
+author: "Emma Jones"
+date: "November 14, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE, echo=TRUE}
+library(tidyverse)
+library(readxl)
+# RODBC is required for Access querying, but it is not available for R3.6.2 so have to install from source
+#install.packages('https://cran.r-project.org/src/contrib/Archive/RODBC/RODBC_1.3-16.tar.gz', repos=NULL, type='source')
+
+options(digits = 7)
+```
+
+
+## Setup
+
+This code was built in R version 3.6.2. It was modified from code by Emma Jones that handled just the Genus level EDAS database, originally inspired by Lou Reynolds and Leah Ettema (USEPA). This version uses a combined Family-level and Genus-level data input and the data schema is identical to the version that will be queried from ODS/CEDS when EDAS is moved into that repository.
+
+The script walks users through the data manipulation steps necessary to run the Family level Virginia Stream Condition Index (VSCI). After initial data manipulation, rarification, and VSCI calculation, the script subsets the pre-rarified samples to demonstrate R and EDAS are generating the same VSCI results.
+
+
+## Family Level VSCI Calculation
+
+Start by bringing in the rarification function and VSCI metrics. These are saved in two separate files to keep the scripts organized.
+
+```{r}
+# Bring in rarify function from file
+source('helperFunctions/rarifyFunction.R')
+
+# Bring in VSCI functions
+source('helperFunctions/VSCI_metrics_GENUS.R')
+
+# Bring in function to allow 64bit/32bit switch in R to query Access 
+source('helperFunctions/accessQueryFunction64to32bit.R')
+```
+
+
+### Master Taxa List
+
+Fist, bring in the Genus level Master Taxa list from EDAS. This list has been cleaned up by Billy Van Wart and Jason Hill in preparation for moving the EDAS database.
+
+```{r master Taxa list query}
+access_query_32_EVJ('data/EDASCombined.accdb', 'MasterTaxaTableNew', 'masterTaxaGenus')
+```
+
+The next step is to isolate the Final VA  Family ID (Family level taxa names) and FinalID (Genus level taxa names) to eventually build a bridge from Genus level data to Family level data. 
+
+```{r taxa bridge}
+edas_options <- select(masterTaxaGenus, Class, Subclass, Order, Suborder, Superfamily, Family, `Final VA Family ID`, FinalID) %>%
+  mutate(across(where(is.factor), as.character))
+edas_list <- select(edas_options, `Final VA Family ID`,FinalID)
+```
+
+From the Genus level Master taxa list, we identify all potential Genus, Family, Order, and Class taxa names. EDAS used to contain a 'TaxaName (unknown)' designation for Family and higher taxonomic levels. This version of the master taxa list and benthics results have removed this designation, so the number of unique Class, Order, and Family options are significantly fewer than previous EDAS versions.
+
+This step allows the code to identify when a taxa is left at a taxonomic level higher than Family to ease excluding taxa in taxa richness calculations.
+
+```{r taxonomicLevels}
+# for Excluding taxa, need a list of all Family level designations that may end up as a FinalID
+# these are all unique Family names and the few taxa that are the only 
+GenusNames <- c(unique(edas_options$FinalID)[!is.na(unique(edas_options$FinalID))])
+FamilyNames <- unique(edas_options$Family)[!is.na(unique(edas_options$Family))]
+SuperfamilyNames <- unique(edas_options$Superfamily)[!is.na(unique(edas_options$Superfamily))]
+SuborderNames <- unique(edas_options$Suborder)[!is.na(unique(edas_options$Suborder))]
+OrderNames <- unique(edas_options$Order)[!is.na(unique(edas_options$Order))]
+SubclassNames <- unique(edas_options$Subclass)[!is.na(unique(edas_options$Subclass))]
+ClassNames <- unique(edas_options$Class)[!is.na(unique(edas_options$Class))]
+
+```
+
+
+#### Tolerance Values 
+
+We need to reorganize the tolerance values from the master taxa list into a more calculation friendly version (i.e. from wide to long).
+
+```{r tolerance Values reorg}
+vmast <- masterTaxaGenus %>%
+  # get Family level tolerance value, FFG
+  rename('GenusTolVal' = 'TolVal',
+         'TolVal' = 'FamTolVal',
+         'GenusFFG' = 'FFG',
+         'FFG' = 'FamFFG',
+         'GenusHabit' = 'Habit',
+         'Habit' = 'FamHabit') %>%
+  mutate(e=ifelse(Order=="Ephemeroptera", 1, 0),
+         p=ifelse(Order=="Plecoptera",1,0),
+         t=ifelse(Order=="Trichoptera", 1, 0),
+         tmin=ifelse((Order=="Trichoptera" & Family != "Hydropsychidae") | 
+                      (Order=="Trichoptera" & is.na(Family)) , 1, 0), 
+         ept=ifelse(e+p+t>0,1,0), 
+         scraper = ifelse(FFG=="Scraper", 1, 0),
+         chiro = ifelse(Family=="Chironomidae",1, 0),
+         ptmin = ifelse(p + tmin > 0,1,0),
+         `clinger-HS` = ifelse(Habit == 'Clinger' & ! Family %in% c("Hydropsychidae","Simuliidae"), 1, 0)) %>%
+  # Then put it in long format so it can be merged to and input taxa list
+  select(`Final VA Family ID`,TolVal, e,p,t, ept,ptmin, scraper, chiro,`clinger-HS`) %>% 
+  distinct(`Final VA Family ID`, .keep_all = T) %>% # drop multiple rows bc working back to family level data from genus
+  filter(!is.na(`Final VA Family ID`)) %>%
+  pivot_longer(-`Final VA Family ID`, names_to = 'metric', values_to = 'metric_val') %>%
+  #  pivot_longer(-`Final VA Family ID`, names_to = 'metric', values_to = 'metric_val') %>%
+  filter(!is.na(metric_val))# %>% # my change to get Hilsenhoff Index calculations to work, need 0s
+  # new step, rename FinalFamID to work with edas_list built off Genus level master taxa list
+  #rename('FinalFamID' = 'Final VA Family ID')
+
+```
+
+
+
+
+```{r howToRunWhenToleranceValuesUpdated, include = FALSE}
+# This is how I wanted to do vmast from Benthics Table, but I won't be able to match Family VSCI scores
+# if I introduce this other level of complexity with different tolerance values.
+# For now I need to just use vmast built off Family level bc there will be no tolerance value isses
+
+#vmast <- read_excel('data/Benthics_Master_Taxa_EVJ_RDM.xlsx','Benthics_Master_Taxa') %>% # Emma's version
+#  select(Phylum, Class, Order, Family, `Final VA Family ID` ,FinalID, TolVal, FFG) %>%
+#  mutate(e=ifelse(Order=="Ephemeroptera", 1, 0),
+#         p=ifelse(Order=="Plecoptera",1,0),
+#         t=ifelse(Order=="Trichoptera", 1, 0),
+#         tmin=ifelse(Order=="Trichoptera" & Family != "Hydropsychidae", 1, 0), 
+#         ept=ifelse(e+p+t>0,1,0), 
+#         scraper = ifelse(FFG=="Scraper", 1, 0),
+#         chiro = ifelse(Family=="Chironomidae (A)" | Family=="Chironomidae (B)",1, 0),
+#         ptmin = ifelse(p+tmin>0,1,0)) %>% 
+#  # Then put it in long format so it can be merged to and input taxa list
+#  select(FinalID,TolVal, e,p,t, ept,ptmin, scraper, chiro) %>% 
+#  filter(!is.na(FinalID)) %>% 
+#  gather(key=metric, value=metric_val, -FinalID)%>% 
+#  filter(!is.na(metric_val)) %>% # my change to get Hilsenhoff Index calculations to work, need 0s
+#  #filter(metric_val>0) %>% # Lou's original code
+#  # Now merge traits back to the full master taxa list
+#  left_join(edas_list, by="FinalID") 
+
+```
+
+### Bring in Genus Level Data
+
+Next, bring in the Benthics table from EDAS. 
+
+
+#### On rarification
+Note- a job on the db side will run this process, but if we ever need to rarify in the future, here is how:
+
+We run the raw data through the rarification function. **Note: the rarification function checks the total bug count on all sites fed to it. This is a great initial QA, but it will be important to not feed the entire database to the function after all the QA work is done as it takes a long time to resample all sites > 110 bugs. When QA done (removed/fixed all R110's that have >110 or were resampled even though initial sample didn't have >110 bugs), will need to build a wrapper function that assesses whether or not R110 in a BenSampID and split database into paired samples (original and R110 version) that don't need to be resampled and sites that are new and do need to be rarified.
+
+**Rarifying dataset of this size takes a considerable amount of time. Run at own risk.** 
+
+Skip this chunk and start working with pre-rarified data in genusDataRare chunk.
+
+
+```{r genusData, include=FALSE}
+#genusDataRaw <- readxl::read_excel("data/Benthics.xlsx", "Benthics") %>%
+#  filter(RepNum == 1)  # keep only Rep1's
+
+#time1 <- Sys.time()
+#genusDataRare <- rarify(genusDataRaw, UID = 'BenSampID', finalID = "FinalID", count = 'Individuals')
+#Sys.time()-time1
+```  
+  
+  
+  
+Access has a mix of upper and lower case BenSampID's that get smashed together. R doesn't work like that, so for now forcing everything to upper case to fix problems with taxa being dropped bc BenSampID's not identical. This should not be a problem in production CEDS.
+  
+```{r genusDataRare}
+# takes a long time so for testing saved it as .RDS
+#access_query_32_EVJ('data/EDASCombined.accdb', 'Benthics', 'benthics')
+
+benthics <- readRDS('data/Benthics.RDS') %>%
+  mutate(BenSampID = toupper(BenSampID))
+
+EDASrare <- benthics %>%
+ ########## #filter(str_detect(BenSampID, 'R110') & RepNum == 1) %>% # keep only rarified data and Rep1's
+  mutate(Count = Individuals, # Rename to match formatting of functions
+         `Excluded Taxa` = ifelse(`Excluded Taxa` == T, -1, 0)) %>% 
+  select(BenSampID, FinalID, Count, `Excluded Taxa`) %>%
+  # Fix FinalID naming issues (unclear Family designation or only Genus in VA range)
+  #mutate(FinalID = recode(FinalID, Pisidiidae = 'Pisidiidae (unknown)',
+  #                        Uenoidae = 'Neophylax',
+  #                        Siphlonuridae = 'Siphlonurus',
+  #                        Rhyacophilidae = 'Rhyacophila')) %>%
+  mutate(GenusTaxaLevel = ifelse(FinalID %in% GenusNames, T, F),
+         FamilyTaxaLevel = ifelse(FinalID %in% FamilyNames, T, F),
+         SuperfamilyTaxaLevel = ifelse(FinalID %in% SuperfamilyNames, T, F),
+         SuborderTaxaLevel = ifelse(FinalID %in% SuborderNames, T, F),
+         OrderTaxaLevel = ifelse(FinalID %in% OrderNames, T, F),
+         SubclassTaxaLevel = ifelse(FinalID %in% SubclassNames, T, F),
+         ClassTaxaLevel = ifelse(FinalID %in% ClassNames, T, F))
+```
+  
+So working with just rarified Genus level data here, need to work back to Family level to get correct tolerance values associated with correct taxa. 
+
+```{r upLevel}
+# Work FinalID back up to Family Level
+EDASrare2 <- left_join(EDASrare,edas_list, by="FinalID") %>%
+  filter(!is.na(`Final VA Family ID`)) %>%
+  rename( `Genus Level Excluded Taxa` = `Excluded Taxa`)
+
+# make sure everything joined
+nrow(filter(EDASrare2, is.na(`Final VA Family ID`)))
+```
+
+We also need to do a little data manipulation to incorporate biologist exclusion information appropriately.
+
+```{r exclusionMath}
+exclusionMath  <- EDASrare2 %>%
+  mutate(`Family Level Excluded Taxa` = 
+           ifelse(`Genus Level Excluded Taxa` == -1, 
+                  ifelse(`SuperfamilyTaxaLevel` == TRUE | `SuborderTaxaLevel` == TRUE | `OrderTaxaLevel` == TRUE | 
+                          `SubclassTaxaLevel` == TRUE | `ClassTaxaLevel` == TRUE , -1, 0), 0 )) %>%
+  # had to get super ifelse nesty here to make this logic work, ugly but works
+  group_by(BenSampID, `Final VA Family ID`) %>%
+  summarise(`Family Level Count` = sum(Count), 
+            #`Genus Level Excluded Taxa` = sum(`Genus Level Excluded Taxa`),
+            `Family Level Taxa` = n(),
+            `Family Level Excluded Taxa` = sum(`Family Level Excluded Taxa`),
+            `Final Family Level Taxa` = `Family Level Taxa` + sum(`Family Level Excluded Taxa`) )
+```
+
+Now that the taxa data will play nicely with the bug traits, we join them. 
+
+```{r bugTraits join}
+bugTraits <- left_join(exclusionMath,vmast,by=c('Final VA Family ID') )
+```
+
+
+### Run Family VSCI
+
+Now run the VSCI.
+
+```{r VSCI}
+final <- VSCIcalculation(bugTraits,exclusionMath,vmast)
+
+#saveRDS(final, 'final_without110Filter.RDS')
+```
+
+
+### VSCI QA with other datasets
+
+Time to check against real VSCI results.
+
+This dataset was run after all updates made to EDAS, so this should match if my calculation is doing exactly what the EDAS calculation is doing, with the same data.
+
+```{r realResults}
+EDASresults <- readxl::read_excel("data/QAdatasets/EmmaQA_July1.xlsx",sheet ='VSCI') %>%
+  mutate(BenSampID = toupper(BenSampID)) # for joining
+
+EDASresultsSub <- filter(EDASresults, BenSampID %in% unique(final$BenSampID))
+```
+
+Quick function to make comparison easier.
+  
+```{r checkFunction}
+oneForOne <- function(df,metricName){
+  z <- mutate_(df, realValue = interp(~v, v= as.name(paste(metricName,'.y',sep='')))) %>%
+    mutate_(newValue = interp(~v, v= as.name(paste(metricName,'.x',sep='')))) %>%
+    mutate(diff = round(realValue - newValue,digits = 3)) %>%
+    select(BenSampID,diff)
+  names(z) <- c('BenSampID',paste(metricName,'_diff',sep=''))
+  return(z)
+}
+#oneForOne(finalVSCI,'%Ephem')
+```
+  
+QA results:  
+```{r}
+finalVSCI <- left_join(final,EDASresultsSub,by="BenSampID")
+
+comparison <- mutate(finalVSCI, FamilyTotalTaxa_diff = FamTotTaxa - `Family Total Taxa`,
+                     FamilyEPTTaxa_diff = FamEPTTax - `Family EPT Taxa`,
+                     FamilyScraper_diff = `Fam%Scrap` - `%FamilyScraper`,
+                     Family2Dom_diff = `Fam%2Dom` - `Family %2 Dominant`,
+                     FamilyHBIScore_diff = FamHBI - `Family HBI`) %>%
+  left_join(oneForOne(finalVSCI,'%Ephem')) %>%
+  left_join(oneForOne(finalVSCI,'%Chiro')) %>%
+  left_join(oneForOne(finalVSCI,'%PT - Hydropsychidae')) %>%
+  left_join(oneForOne(finalVSCI,'%Ephem Score')) %>%
+  left_join(oneForOne(finalVSCI,'%PT-H Score')) %>%
+  left_join(oneForOne(finalVSCI,'Fam Richness Score')) %>%
+  left_join(oneForOne(finalVSCI,'Fam SCI')) %>%
+  select(BenSampID, ends_with('_diff')) %>%
+  # only look at ones that have data from both
+  filter(!is.na(FamilyTotalTaxa_diff))
+
+#More QA
+comparisonIssues <- filter(comparison, `Fam SCI_diff` != 0)
+comparisonIssues1 <- filter(comparison, `Fam SCI_diff` >1 | `Fam SCI_diff` < -1)
+comparisonIssues0.5 <- filter(comparison, `Fam SCI_diff` >0.5 | `Fam SCI_diff` < -0.5)
+comparisonIssues0.1 <- filter(comparison, `Fam SCI_diff` > -0.1 & `Fam SCI_diff` < 0.1)
+
+nrow(filter(comparison, `Fam SCI_diff` == 0))
+#VSCIproblems <- filter(final, BenSampID %in% comparisonIssues$BenSampID)
+
+```
+
+Now save a excel workbook of all QA results to share with group.
+
+```{r VSCI QA output}
+
+finalVSCIout <- mutate(final, Calculator = 'Emma') %>%
+  filter(BenSampID %in% EDASresultsSub$BenSampID)
+EDASresultsSubout <- mutate(EDASresultsSub, Calculator = 'EDAS') %>%
+  rename('Family Total Taxa' =  "FamTotTaxa" ,
+         "Family EPT Taxa" = 'FamEPTTax',
+         "%FamilyScraper" = "Fam%Scrap",
+         "Family %2 Dominant" = "Fam%2Dom",
+         "Family HBI" = 'FamHBI') %>%
+  dplyr::select(names(finalVSCIout))
+
+names(finalVSCIout) == names(EDASresultsSubout)
+
+lineup <- bind_rows(finalVSCIout, EDASresultsSubout) %>%
+  arrange(BenSampID, Calculator) %>%
+  dplyr::select(Calculator,everything())
+
+write.csv(lineup, 'data/EmmaQAoutputs/VSCIstacked.csv', row.names = F)
+write.csv(comparisonIssues1, 'data/EmmaQAoutputs/VSCIcomparisonGreaterThanABS(1).csv', row.names = F)
+write.csv(comparisonIssues0.5, 'data/EmmaQAoutputs/VSCIcomparisonGreaterThanABS(0.5).csv', row.names = F)
+
+```
+
+
+
+
+
+## Family Level VCPMI 63 + Chowan
+
+Bring in metrics specific to the VCPMI 63 + Chowan methods. This analysis will run the analysis on any data provided and will not discriminate on whether this is the appropriate method (spatially). This will allow the most QA information as EDAS calculates VCPMI63/65 on all data provided. The spatial analysis will be programmed later to flag data. 
+
+
+```{r VCPMI functions}
+# Bring in VSCI functions
+source('helperFunctions/VCPMI_metrics_GENUS.R')
+```
+
+Now run the VCPMI63+CHOWAN (on everyone).
+
+```{r VCPMI63}
+VCPMI63 <- VCPMI63calculation(bugTraits,exclusionMath,vmast)
+```
+
+
+```{r realResults}
+VCPMI63results <- readxl::read_excel("data/QAdatasets/EmmaQA_July1.xlsx",sheet ='VCPMI63+Chowan') %>%
+  mutate(BenSampID = toupper(BenSampID)) %>% # for joining
+  filter( BenSampID %in% unique(VCPMI63$BenSampID))
+```
+
+  
+QA results:  
+```{r}
+VCPMI63join <- left_join(VCPMI63,VCPMI63results,by="BenSampID") 
+
+VCPMI63comparison <- mutate(VCPMI63join, 
+                            FamilyTotalTaxa_diff = TotTaxa - `Family Total Taxa`,
+                            FamilyHBI_diff = HBI - `Family HBI`,
+                            FamilyEPTTaxa_diff = EPTTax - `Family EPT Taxa`,
+                            Family5Dom_diff = `%5Dom` - `Family %5 Dominant`,
+                            RichnessFinal_diff = RichnessFinal - `Richness Final`,
+                            HBIScore_diff = HBIScore - `HBI Score`,
+                            HBIFinal_diff = HBIFinal - `HBI Final`,
+                            EPTFinal_diff = EPTFinal - `EPT Final`) %>%
+  left_join(oneForOne(VCPMI63join,'%Ephem')) %>%
+  left_join(oneForOne(VCPMI63join,'%PT - Hydropsychidae')) %>%
+  left_join(oneForOne(VCPMI63join,'%ClngP-HS')) %>%
+  left_join(oneForOne(VCPMI63join,'EPT Score')) %>%
+  left_join(oneForOne(VCPMI63join,'EPHEM')) %>%
+  left_join(oneForOne(VCPMI63join,'PT-H')) %>%
+  left_join(oneForOne(VCPMI63join,'Pct5DOM')) %>%
+  left_join(oneForOne(VCPMI63join,'PctClng-HS')) %>%
+  left_join(oneForOne(VCPMI63join,'CPMI63+CHOWAN')) %>%
+  select(BenSampID, ends_with('_diff')) %>%
+  # only look at ones that have data from both
+  filter(!is.na(FamilyTotalTaxa_diff))
+
+#More QA
+VCPMI63comparisonIssues <- filter(VCPMI63comparison, `CPMI63+CHOWAN_diff` != 0)
+VCPMI63comparisonIssues1 <- filter(VCPMI63comparison,  `CPMI63+CHOWAN_diff` >1 |  `CPMI63+CHOWAN_diff` < -1)
+VCPMI63comparisonIssues0.5 <- filter(VCPMI63comparison,  `CPMI63+CHOWAN_diff` >0.5 |  `CPMI63+CHOWAN_diff` < -0.5)
+
+
+#VCPMI63problems <- filter(VCPMI63, BenSampID %in% VCPMI63comparisonIssues$BenSampID)
+
+```
+
+
+Now save a excel workbook of all QA results to share with group.
+
+```{r VSCI QA output}
+
+finalVCPMI63out <- mutate(VCPMI63, Calculator = 'Emma') %>%
+  filter(BenSampID %in% VCPMI63results$BenSampID)
+VCPMI63resultsout <- mutate(VCPMI63results, Calculator = 'EDAS') %>%
+  rename('Family Total Taxa' =  "TotTaxa" ,
+         'Family HBI' = 'HBI',
+         'Family EPT Taxa' = 'EPTTax',
+         'Family %5 Dominant' = '%5Dom',
+         'Richness Final' = 'RichnessFinal',
+         'HBI Score' = 'HBIScore',
+         'HBI Final' = 'HBIFinal',
+         'EPT Final' = 'EPTFinal') %>%
+  dplyr::select(names(finalVCPMI63out))
+
+
+names(finalVCPMI63out) == names(VCPMI63resultsout)
+
+VCPMI63lineup <- bind_rows(finalVCPMI63out, VCPMI63resultsout) %>%
+  arrange(BenSampID, Calculator) %>%
+  dplyr::select(Calculator,everything())
+
+write.csv(VCPMI63lineup, 'data/EmmaQAoutputs/VCPMI63stacked.csv', row.names = F)
+write.csv(VCPMI63comparisonIssues1, 'data/EmmaQAoutputs/VCPMI63comparisonGreaterThanABS(1).csv', row.names = F)
+write.csv(VCPMI63comparisonIssues0.5, 'data/EmmaQAoutputs/VCPMI63comparisonGreaterThanABS(0.5).csv', row.names = F)
+
+```
+
+
+
+
+## Family Level VCPMI 65 - Chowan
+
+Bring in metrics specific to the VCPMI 65 - Chowan methods. This analysis will run the analysis on any data provided and will not discriminate on whether this is the appropriate method (spatially). This will allow the most QA information as EDAS calculates VCPMI63/65 on all data provided. The spatial analysis will be programmed later to flag data. 
+
+
+```{r VCPMI functions}
+# Bring in VSCI functions
+source('helperFunctions/VCPMI_metrics_GENUS.R')
+```
+
+Now run the VCPMI65-CHOWAN (on everyone).
+
+```{r VCPMI65}
+VCPMI65 <- VCPMI65calculation(bugTraits,exclusionMath,vmast)
+```
+
+
+```{r realResults}
+VCPMI65results <- readxl::read_excel("data/QAdatasets/EmmaQA_July1.xlsx",sheet ='VCPMI65-Chowan') %>%
+  mutate(BenSampID = toupper(BenSampID)) %>% # for joining
+  filter( BenSampID %in% unique(VCPMI65$BenSampID))
+```
+
+  
+QA results:  
+```{r}
+VCPMI65join <- left_join(VCPMI65,VCPMI65results,by="BenSampID") 
+
+VCPMI65comparison <- mutate(VCPMI65join, 
+                            FamilyTotalTaxa_diff = TotTaxa - `Family Total Taxa`,
+                            FamilyHBI_diff = HBI - `Family HBI`,
+                            FamilyEPTTaxa_diff = EPTTax - `Family EPT Taxa`,
+                            RichnessFinal_diff = RichnessFinal - `Richness Final`,
+                            HBIScore_diff = HBIScore - `HBI Score`,
+                            HBIFinal_diff = HBIFinal - `HBI Final`,
+                            EPTFinal_diff = EPTFinal - `EPT Final`) %>%
+  left_join(oneForOne(VCPMI65join,'%Ephem')) %>%
+  left_join(oneForOne(VCPMI65join,'%PT - Hydropsychidae')) %>%
+  left_join(oneForOne(VCPMI65join,'%ClngP-HS')) %>%
+  left_join(oneForOne(VCPMI65join,'%Scrap')) %>%
+  left_join(oneForOne(VCPMI65join,'%Intoler')) %>%
+  left_join(oneForOne(VCPMI65join,'EPT Score')) %>%
+  left_join(oneForOne(VCPMI65join,'EPHEM')) %>%
+  left_join(oneForOne(VCPMI65join,'PT-H')) %>%
+  left_join(oneForOne(VCPMI65join,'PctScrap')) %>%
+  left_join(oneForOne(VCPMI65join,'PctClng-HS')) %>%
+  left_join(oneForOne(VCPMI65join,'PctIntol')) %>%
+  left_join(oneForOne(VCPMI65join,'CPMI65-CHOWAN')) %>%
+  select(BenSampID, ends_with('_diff')) %>%
+  # only look at ones that have data from both
+  filter(!is.na(FamilyTotalTaxa_diff))
+
+#More QA
+VCPMI65comparisonIssues <- filter(VCPMI65comparison, `CPMI65-CHOWAN_diff` != 0)
+VCPMI65comparisonIssues1 <- filter(VCPMI65comparison,  `CPMI65-CHOWAN_diff` >1 |  `CPMI65-CHOWAN_diff` < -1)
+VCPMI65comparisonIssues0.5 <- filter(VCPMI65comparison,  `CPMI65-CHOWAN_diff` >0.5 |  `CPMI65-CHOWAN_diff` < -0.5)
+
+
+#VCPMI65problems <- filter(VCPMI65, BenSampID %in% VCPMI65comparisonIssues$BenSampID)
+
+```
+
+
+Now save a excel workbook of all QA results to share with group.
+
+```{r VSCI QA output}
+
+finalVCPMI65out <- mutate(VCPMI65, Calculator = 'Emma') %>%
+  filter(BenSampID %in% VCPMI65results$BenSampID)
+VCPMI65resultsout <- mutate(VCPMI65results, Calculator = 'EDAS') %>%
+  rename('Family Total Taxa' =  "TotTaxa" ,
+         'Family HBI' = 'HBI',
+         'Family EPT Taxa' = 'EPTTax',
+         'Richness Final' = 'RichnessFinal',
+         'HBI Score' = 'HBIScore',
+         'HBI Final' = 'HBIFinal',
+         'EPT Final' = 'EPTFinal') %>%
+  dplyr::select(names(finalVCPMI65out))
+
+
+names(finalVCPMI65out) == names(VCPMI65resultsout)
+
+VCPMI65lineup <- bind_rows(finalVCPMI65out, VCPMI65resultsout) %>%
+  arrange(BenSampID, Calculator) %>%
+  dplyr::select(Calculator,everything())
+
+write.csv(VCPMI65lineup, 'data/EmmaQAoutputs/VCPMI65stacked.csv', row.names = F)
+write.csv(VCPMI65comparisonIssues1, 'data/EmmaQAoutputs/VCPMI65comparisonGreaterThanABS(1).csv', row.names = F)
+write.csv(VCPMI65comparisonIssues0.5, 'data/EmmaQAoutputs/VCPMI65comparisonGreaterThanABS(0.5).csv', row.names = F)
+write.csv(VCPMI65comparisonIssues, 'data/EmmaQAoutputs/VCPMI65comparison.csv', row.names = F)
+
+
+```
