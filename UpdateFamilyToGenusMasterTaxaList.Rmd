@@ -9,16 +9,31 @@ output: html_document
 knitr::opts_chunk$set(echo = FALSE)
 # built in R 3.6.2
 library(tidyverse)
+library(lubridate)
 library(config)
 library(pool)
 library(pins)
 library(readxl)
+library(dbplyr)
 
 # Server connection things
 conn <- config::get("connectionSettings") # get configuration settings
 
 board_register_rsconnect(key = conn$CONNECT_API_KEY,  #Sys.getenv("CONNECT_API_KEY"),
                          server = conn$CONNECT_SERVER)#Sys.getenv("CONNECT_SERVER"))
+
+## For testing: connect to ODS production
+pool <- dbPool(
+  drv = odbc::odbc(),
+  Driver = "ODBC Driver 11 for SQL Server",#Driver = "SQL Server Native Client 11.0",
+  Server= "DEQ-SQLODS-PROD,50000",
+  dbname = "ODS",
+  trusted_connection = "yes"
+)
+
+source('helperFunctions/VSCI_metrics_GENUS.R')
+source('helperFunctions/VCPMI_metrics_GENUS.R')
+
 ```
 
 ## Background
@@ -43,10 +58,380 @@ masterTaxaListGenus <- pin_get('ejones/masterTaxaGenus', board = 'rsconnect')
 This is the final version from Drew and Billy.
 
 ```{r new genus master taxa list}
-masterTaxaListGenusNew <- read_excel('data/masterTaxaGenus_27Sept2021.xlsx', sheet = 'masterTaxaGenus') 
+masterTaxaListGenusNew <- read_excel('data/masterTaxaGenus_27Sept2021.xlsx', sheet = 'masterTaxaGenus') %>% 
+  mutate_at(c("FamTolVal", "TolVal", "GVSCI_TolVal"), as.numeric)
 # replace character NA with NA
 masterTaxaListGenusNew[masterTaxaListGenusNew == "NA"] <- NA
 glimpse(masterTaxaListGenusNew)
+glimpse(masterTaxaListGenus)
 
+# what are the rows with changed FinalID?
+filter(masterTaxaListGenusNew, ! FinalID %in% masterTaxaListGenus$FinalID)
+
+# any changes between FinalID and OldFinalID columns?
+mutate(masterTaxaListGenusNew, diff = ifelse(FinalID != OldFinalID, 1, 0)) %>% 
+  arrange(desc(diff))
+
+
+# any changes between FinalID and OldFinalID columns?
+mutate(masterTaxaListGenusNew, diff = ifelse(FinalID != GVSCI_FinalID, 1, 0)) %>% 
+  arrange(desc(diff))
 ```
 
+So quick differences are 10 new rows, 29 changed FinalID's, two name changes between FinalID and OldFinalID, and 73 changes from FinalID to GVSCI_FinalID.
+
+
+### Test VSCI calculation with new master taxa out of the box
+
+Pull test benthic data and run VSCI to see if any changes
+
+```{r test vsci prep}
+# just get fields needed for SCI
+masterTaxaGenus <- masterTaxaListGenusNew %>% 
+  dplyr::select(Phylum, Class, Subclass, Order, Suborder, Superfamily, Family, Subfamily, Tribe, 
+                Genus, Species, `Final VA Family ID`, FinalID, TolVal, FFG, 
+                Habit, FamFFG, FamTolVal, FamHabit) # keep EDAS Master Taxa list names
+
+vmast <- masterTaxaGenus %>%
+        # get Family level tolerance value, FFG
+        rename('GenusTolVal' = 'TolVal',
+               'TolVal' = 'FamTolVal',
+               'GenusFFG' = 'FFG',
+               'FFG' = 'FamFFG',
+               'GenusHabit' = 'Habit',
+               'Habit' = 'FamHabit') %>%
+        mutate(e=ifelse(Order=="Ephemeroptera", 1, 0),
+               p=ifelse(Order=="Plecoptera",1,0),
+               t=ifelse(Order=="Trichoptera", 1, 0),
+               tmin=ifelse((Order=="Trichoptera" & Family != "Hydropsychidae") | 
+                             (Order=="Trichoptera" & is.na(Family)) , 1, 0), 
+               ept=ifelse(e+p+t>0,1,0), 
+               scraper = ifelse(FFG=="Scraper", 1, 0),
+               chiro = ifelse(Family=="Chironomidae",1, 0),
+               ptmin = ifelse(p + tmin > 0,1,0),
+               `clinger-HS` = ifelse(Habit == 'Clinger' & ! Family %in% c("Hydropsychidae","Simuliidae"), 1, 0)) %>%
+        # Then put it in long format so it can be merged to and input taxa list
+        select(`Final VA Family ID`,TolVal, e,p,t, ept,ptmin, scraper, chiro,`clinger-HS`) %>% 
+        distinct(`Final VA Family ID`, .keep_all = T) %>% # drop multiple rows bc working back to family level data from genus
+        filter(!is.na(`Final VA Family ID`)) %>%
+        pivot_longer(-`Final VA Family ID`, names_to = 'metric', values_to = 'metric_val') %>%
+        #  pivot_longer(-`Final VA Family ID`, names_to = 'metric', values_to = 'metric_val') %>%
+        filter(!is.na(metric_val))
+
+### SCI calculation
+
+SCI <- function(stationBenthicsDateRange, SCIchoice, benSamps, masterTaxaGenus, vmast){
+  edas_options <- select(masterTaxaGenus, Class, Subclass, Order, Suborder, Superfamily, Family, `Final VA Family ID`, FinalID) %>%
+    mutate(across(where(is.factor), as.character))
+  edas_list <- select(edas_options, `Final VA Family ID`,FinalID)
+  # for Excluding taxa, need a list of all Family level designations that may end up as a FinalID
+  # these are all unique Family names and the few taxa that are the only 
+  GenusNames <- c(unique(edas_options$FinalID)[!is.na(unique(edas_options$FinalID))])
+  FamilyNames <- unique(edas_options$Family)[!is.na(unique(edas_options$Family))]
+  SuperfamilyNames <- unique(edas_options$Superfamily)[!is.na(unique(edas_options$Superfamily))]
+  SuborderNames <- unique(edas_options$Suborder)[!is.na(unique(edas_options$Suborder))]
+  OrderNames <- unique(edas_options$Order)[!is.na(unique(edas_options$Order))]
+  SubclassNames <- unique(edas_options$Subclass)[!is.na(unique(edas_options$Subclass))]
+  ClassNames <- unique(edas_options$Class)[!is.na(unique(edas_options$Class))]
+  
+  
+  EDASrare <- stationBenthicsDateRange %>%
+    ########## #filter(str_detect(BenSampID, 'R110') & RepNum == 1) %>% # keep only rarified data and Rep1's
+    mutate(Count = Individuals) %>% # Rename to match formatting of functions
+    ######`Excluded Taxa` = ifelse(`Excluded Taxa` == T, -1, 0)) %>% 
+    select(BenSampID, FinalID, Count, `Excluded Taxa`) %>%
+    mutate(GenusTaxaLevel = ifelse(FinalID %in% GenusNames, T, F),
+           FamilyTaxaLevel = ifelse(FinalID %in% FamilyNames, T, F),
+           SuperfamilyTaxaLevel = ifelse(FinalID %in% SuperfamilyNames, T, F),
+           SuborderTaxaLevel = ifelse(FinalID %in% SuborderNames, T, F),
+           OrderTaxaLevel = ifelse(FinalID %in% OrderNames, T, F),
+           SubclassTaxaLevel = ifelse(FinalID %in% SubclassNames, T, F),
+           ClassTaxaLevel = ifelse(FinalID %in% ClassNames, T, F))
+  
+  # Work FinalID back up to Family Level
+  EDASrare2 <- left_join(EDASrare,edas_list, by="FinalID") %>%
+    filter(!is.na(`Final VA Family ID`)) %>%
+    rename( `Genus Level Excluded Taxa` = `Excluded Taxa`)
+  
+  # We also need to do a little data manipulation to incorporate biologist exclusion information appropriately.
+  exclusionMath  <- EDASrare2 %>%
+    mutate(`Family Level Excluded Taxa` = 
+             ifelse(`Genus Level Excluded Taxa` == -1, 
+                    ifelse(`SuperfamilyTaxaLevel` == TRUE | `SuborderTaxaLevel` == TRUE | `OrderTaxaLevel` == TRUE | 
+                             `SubclassTaxaLevel` == TRUE | `ClassTaxaLevel` == TRUE , -1, 0), 0 )) %>%
+    # had to get super ifelse nesty here to make this logic work, ugly but works
+    group_by(BenSampID, `Final VA Family ID`) %>%
+    summarise(`Family Level Count` = sum(Count), 
+              #`Genus Level Excluded Taxa` = sum(`Genus Level Excluded Taxa`),
+              `Family Level Taxa` = n(),
+              `Family Level Excluded Taxa` = sum(`Family Level Excluded Taxa`),
+              `Final Family Level Taxa` = `Family Level Taxa` + sum(`Family Level Excluded Taxa`) )
+  
+  # Join bug traits
+  bugTraits <- left_join(exclusionMath,vmast,by=c('Final VA Family ID') )
+  
+  
+  if(SCIchoice == 'VSCI'){SCI <- VSCIcalculation(bugTraits,exclusionMath,vmast) %>%
+    mutate(SCI = 'VSCI',
+           `SCI Threshold` = 60) %>% 
+    rename("SCI Score" ="Fam SCI")}
+  if(SCIchoice == 'VCPMI63 + Chowan'){SCI <- VCPMI63calculation(bugTraits,exclusionMath,vmast) %>%
+    mutate(SCI = 'VCPMI63 + Chowan',
+           `SCI Threshold` = 40) %>% 
+    rename("SCI Score" ="CPMI63+CHOWAN")}
+  if(SCIchoice == 'VCPMI65 - Chowan'){SCI <- VCPMI65calculation(bugTraits,exclusionMath,vmast) %>%
+    mutate(SCI = 'VCPMI65 - Chowan',
+           `SCI Threshold` = 40) %>% 
+    rename("SCI Score" ="CPMI65-CHOWAN")}
+  
+  SCI <- left_join(SCI, benSamps, by = 'BenSampID')
+  
+  return(SCI) 
+}
+```
+
+
+```{r benthics}
+# pull benthics
+benthics <- pool %>% tbl(in_schema("wqm",  "Edas_Benthic_View")) %>%
+        as_tibble() %>%
+        rename( "StationID" = "STA_ID",
+                "BenSampID"  = "WBS_SAMP_ID",
+                "RepNum" = "WBS_REP_NUM",
+                "FinalID" = "WBMT_FINAL_ID",
+                "Individuals" = "WBE_INDIVIDUALS",
+                "ID Comments" = "WBE_COMMENT",
+                "Entered By" = "WBE_INSERTED_BY", # not in EDAS table but good info
+                "Taxonomist" = "TAXONOMIST_NAME",  # not in EDAS table but good info
+                "Entered Date" = "WBE_INSERTED_DATE") %>%
+        mutate(`Excluded Taxa` = ifelse(WBE_EXCLUDED_TAXA_YN == "Y", -1, 0)) %>%
+        dplyr::select(StationID, BenSampID, RepNum, FinalID, Individuals, `Excluded Taxa`, `ID Comments`, Taxonomist, `Entered By`, `Entered Date`)
+
+#pull bensamps
+benSamps <- pool %>% tbl(in_schema("wqm",  "Edas_Benthic_Sample_View")) %>%
+        as_tibble() %>%
+        # fix names
+        rename( "StationID" = "STA_ID",
+                "BenSampID"  = "WBS_SAMP_ID",
+                "RepNum" = "WBS_REP_NUM",
+                "Sample Comments" = "WBS_COMMENT",
+                "Entered By" = "WBS_INSERTED_BY", # not in EDAS table but good info
+                "Collected By" = "COLLECTOR_NAME",  # not in EDAS table but good info
+                "Entered Date" = "WBS_INSERTED_DATE",
+                "Gradient" = "WBCM_DESCRIPTION",
+                "Taxonomist" = "TAXONOMIST_NAME",  # not in EDAS table but good info
+                "Target Count" = "WBS_TARGET_COUNT",
+                "Field Team" = "WBS_FIELD_TEAM",
+                "Collection Date" = "FDT_DATE_TIME") %>%
+        # Add sample season 
+        mutate(monthday = as.numeric(paste0(sprintf("%02d",month(`Collection Date`)),
+                                            sprintf("%02d",day(`Collection Date`)))),
+               Season = case_when(monthday >= 0215 & monthday <= 0615 ~ 'Spring',
+                                  monthday >= 0815 & monthday <= 1215 ~ 'Fall',
+                                  TRUE ~ as.character("Outside Sample Window"))) %>%
+        dplyr::select(StationID, BenSampID, RepNum, `Collection Date`, `Sample Comments`, `Collected By`, `Field Team`, `Entered By`,
+                      Taxonomist, `Entered Date`, Gradient, `Target Count`, Season)
+
+
+
+# run everyone through VSCI
+VSCIresults <- SCI(benthics, "VSCI", benSamps,  masterTaxaGenus, vmast) %>%
+        mutate_if(is.numeric, round, digits=2) %>%# rounds all numeric columns to 2 decimal places
+        arrange(`Collection Date`)
+VSCIresults$Season <-  factor(VSCIresults$Season,levels=c("Spring","Outside Sample Window","Fall"))#,ordered=T)
+
+```
+Compare to existing VSCI results.
+
+```{r VSCI results comparison}
+VSCIresultsPin <- pin_get("ejones/VSCIresults", board = "rsconnect")
+
+comparison <- left_join(VSCIresultsPin, VSCIresults,  by = c("BenSampID",   "SCI", "SCI Threshold", "StationID", "RepNum", "Collection Date", "Sample Comments", "Collected By", "Field Team", "Entered By", "Taxonomist", "Entered Date", "Gradient", "Target Count", "Season")) %>% 
+  mutate(difference = abs(`SCI Score.x` - `SCI Score.y`)) %>% 
+  dplyr::select(sort(current_vars())) %>%  #arrange names alphabetically
+  dplyr::select(difference, BenSampID, StationID, `Collection Date`, everything()) %>% 
+  arrange(desc(difference))
+
+nrow(filter(comparison, difference !=0)) # 41 issues, not bad
+```
+
+```{r}
+# efficiently work through problems
+knownIssues <- filter(benthics, FinalID %in% c('Nixe', 'Plectrocnemia')) %>% 
+  distinct(BenSampID) %>% pull()
+View(
+filter(comparison, difference !=0) %>% 
+  filter(BenSampID %in% knownIssues))
+```
+
+
+```{r}
+benSamps1 <- benSamps
+
+sampleID <- 
+#'LIV8493R110' #Nixe
+#'XMJ19555R110' #Plectrocnemia
+#'GOO8492'  #Nixe
+#'GOO8492R110' #Nixe
+
+stationBenthicsDateRange<- filter(benthics, BenSampID %in% sampleID) 
+SCIchoice <- "VSCI"
+benSamps <- filter(benSamps1, BenSampID %in% sampleID) 
+#masterTaxaGenus, vmast, benSamps, masterTaxaGenus, vmast
+```
+
+```{r}
+
+  
+  EDASrare <- stationBenthicsDateRange %>%
+    ########## #filter(str_detect(BenSampID, 'R110') & RepNum == 1) %>% # keep only rarified data and Rep1's
+    mutate(Count = Individuals) %>% # Rename to match formatting of functions
+    ######`Excluded Taxa` = ifelse(`Excluded Taxa` == T, -1, 0)) %>% 
+    select(BenSampID, FinalID, Count, `Excluded Taxa`) %>%
+    mutate(GenusTaxaLevel = ifelse(FinalID %in% GenusNames, T, F),
+           FamilyTaxaLevel = ifelse(FinalID %in% FamilyNames, T, F),
+           SuperfamilyTaxaLevel = ifelse(FinalID %in% SuperfamilyNames, T, F),
+           SuborderTaxaLevel = ifelse(FinalID %in% SuborderNames, T, F),
+           OrderTaxaLevel = ifelse(FinalID %in% OrderNames, T, F),
+           SubclassTaxaLevel = ifelse(FinalID %in% SubclassNames, T, F),
+           ClassTaxaLevel = ifelse(FinalID %in% ClassNames, T, F))
+  
+  # Work FinalID back up to Family Level
+  EDASrare2 <- left_join(EDASrare,edas_list, by="FinalID") %>%
+    filter(!is.na(`Final VA Family ID`)) %>%
+    rename( `Genus Level Excluded Taxa` = `Excluded Taxa`)
+  
+  # We also need to do a little data manipulation to incorporate biologist exclusion information appropriately.
+  exclusionMath  <- EDASrare2 %>%
+    mutate(`Family Level Excluded Taxa` = 
+             ifelse(`Genus Level Excluded Taxa` == -1, 
+                    ifelse(`SuperfamilyTaxaLevel` == TRUE | `SuborderTaxaLevel` == TRUE | `OrderTaxaLevel` == TRUE | 
+                             `SubclassTaxaLevel` == TRUE | `ClassTaxaLevel` == TRUE , -1, 0), 0 )) %>%
+    # had to get super ifelse nesty here to make this logic work, ugly but works
+    group_by(BenSampID, `Final VA Family ID`) %>%
+    summarise(`Family Level Count` = sum(Count), 
+              #`Genus Level Excluded Taxa` = sum(`Genus Level Excluded Taxa`),
+              `Family Level Taxa` = n(),
+              `Family Level Excluded Taxa` = sum(`Family Level Excluded Taxa`),
+              `Final Family Level Taxa` = `Family Level Taxa` + sum(`Family Level Excluded Taxa`) )
+  
+  # Join bug traits
+  bugTraits <- left_join(exclusionMath,vmast,by=c('Final VA Family ID') )
+  
+  
+  if(SCIchoice == 'VSCI'){SCI <- VSCIcalculation(bugTraits,exclusionMath,vmast) %>%
+    mutate(SCI = 'VSCI',
+           `SCI Threshold` = 60) %>% 
+    rename("SCI Score" ="Fam SCI")}
+  if(SCIchoice == 'VCPMI63 + Chowan'){SCI <- VCPMI63calculation(bugTraits,exclusionMath,vmast) %>%
+    mutate(SCI = 'VCPMI63 + Chowan',
+           `SCI Threshold` = 40) %>% 
+    rename("SCI Score" ="CPMI63+CHOWAN")}
+  if(SCIchoice == 'VCPMI65 - Chowan'){SCI <- VCPMI65calculation(bugTraits,exclusionMath,vmast) %>%
+    mutate(SCI = 'VCPMI65 - Chowan',
+           `SCI Threshold` = 40) %>% 
+    rename("SCI Score" ="CPMI65-CHOWAN")}
+  
+  SCI <- left_join(SCI, benSamps, by = 'BenSampID')
+```
+
+
+Now test with VCPMI
+
+Compare to existing VSCI results.
+
+```{r VCPMI results comparison}
+benSamps <- benSamps1 #reset
+
+VCPMI63results <- SCI(benthics, "VCPMI63 + Chowan", benSamps,  masterTaxaGenus, vmast) %>%
+        mutate_if(is.numeric, round, digits=2) %>%# rounds all numeric columns to 2 decimal places
+        arrange(`Collection Date`)
+VCPMI63results$Season <-  factor(VCPMI63results$Season,levels=c("Spring","Outside Sample Window","Fall"))#,ordered=T)
+
+VCPMI63resultsPin <- pin_get("ejones/VCPMI63results", board = "rsconnect")
+
+comparison <- left_join(VCPMI63resultsPin, VCPMI63results,  by = c("BenSampID",   "SCI", "SCI Threshold", "StationID", "RepNum", "Collection Date", "Sample Comments", "Collected By", "Field Team", "Entered By", "Taxonomist", "Entered Date", "Gradient", "Target Count", "Season")) %>% 
+  mutate(difference = abs(`SCI Score.x` - `SCI Score.y`)) %>% 
+  dplyr::select(sort(current_vars())) %>%  #arrange names alphabetically
+  dplyr::select(difference, BenSampID, StationID, `Collection Date`, everything()) %>% 
+  arrange(desc(difference))
+
+nrow(filter(comparison, difference !=0)) # 41 issues, not bad
+```
+35 issues
+
+
+```{r}
+# efficiently work through problems
+knownIssues <- filter(benthics, FinalID %in% c('Nixe', 'Plectrocnemia')) %>% 
+  distinct(BenSampID) %>% pull()
+View(
+filter(comparison, difference !=0) %>% 
+  filter(BenSampID %in% knownIssues))
+```
+
+
+```{r}
+benSamps1 <- benSamps
+
+sampleID <- 
+#'LIV8493R110' #Nixe
+#'XMJ19555R110' #Plectrocnemia
+#'GOO8492'  #Nixe
+#'GOO8492R110' #Nixe
+
+stationBenthicsDateRange<- filter(benthics, BenSampID %in% sampleID) 
+SCIchoice <- "VSCI"
+benSamps <- filter(benSamps1, BenSampID %in% sampleID) 
+#masterTaxaGenus, vmast, benSamps, masterTaxaGenus, vmast
+```
+
+Now test with VCPMI
+
+Compare to existing VSCI results.
+
+```{r VCPMI results comparison}
+benSamps <- benSamps1 #reset
+
+VCPMI65results <- SCI(benthics, "VCPMI65 - Chowan", benSamps,  masterTaxaGenus, vmast) %>%
+        mutate_if(is.numeric, round, digits=2) %>%# rounds all numeric columns to 2 decimal places
+        arrange(`Collection Date`)
+VCPMI65results$Season <-  factor(VCPMI63results$Season,levels=c("Spring","Outside Sample Window","Fall"))#,ordered=T)
+
+VCPMI65resultsPin <- pin_get("ejones/VCPMI65results", board = "rsconnect")
+
+comparison <- left_join(VCPMI63resultsPin, VCPMI63results,  by = c("BenSampID",   "SCI", "SCI Threshold", "StationID", "RepNum", "Collection Date", "Sample Comments", "Collected By", "Field Team", "Entered By", "Taxonomist", "Entered Date", "Gradient", "Target Count", "Season")) %>% 
+  mutate(difference = abs(`SCI Score.x` - `SCI Score.y`)) %>% 
+  dplyr::select(sort(current_vars())) %>%  #arrange names alphabetically
+  dplyr::select(difference, BenSampID, StationID, `Collection Date`, everything()) %>% 
+  arrange(desc(difference))
+
+nrow(filter(comparison, difference !=0)) # 41 issues, not bad
+```
+35
+
+
+```{r}
+# efficiently work through problems
+knownIssues <- filter(benthics, FinalID %in% c('Nixe', 'Plectrocnemia')) %>% 
+  distinct(BenSampID) %>% pull()
+View(
+filter(comparison, difference !=0) %>% 
+  filter(BenSampID %in% knownIssues))
+```
+
+
+```{r}
+benSamps1 <- benSamps
+
+sampleID <- 
+#'LIV8493R110' #Nixe
+#'XMJ19555R110' #Plectrocnemia
+#'GOO8492'  #Nixe
+#'GOO8492R110' #Nixe
+
+stationBenthicsDateRange<- filter(benthics, BenSampID %in% sampleID) 
+SCIchoice <- "VSCI"
+benSamps <- filter(benSamps1, BenSampID %in% sampleID) 
+#masterTaxaGenus, vmast, benSamps, masterTaxaGenus, vmast
+```
