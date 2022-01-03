@@ -1,5 +1,5 @@
 ---
-title: "How To Run the VSCI0- Combined Family and Genus Database Version"
+title: "How To Run the VSCI- Combined Family and Genus Database Version"
 author: "Emma Jones"
 date: "November 14, 2018"
 output: html_document
