@@ -49,3 +49,4 @@ ODSdataComparison/
 olderVersions/
 poolBasics.R
 testODSserver*
+config.yml

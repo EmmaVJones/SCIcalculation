@@ -1,5 +1,5 @@
 ---
-title: "Update Family to Genus Master Taxa List"
+title: "Update Genus Master Taxa List"
 author: "Emma Jones"
 date: "1/3/2022"
 output: html_document
@@ -8,22 +8,45 @@ output: html_document
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = FALSE)
 # built in R 3.6.2
+library(tidyverse)
+library(config)
+library(pool)
+library(pins)
+library(readxl)
 
+# Server connection things
+conn <- config::get("connectionSettings") # get configuration settings
+
+board_register_rsconnect(key = conn$CONNECT_API_KEY,  #Sys.getenv("CONNECT_API_KEY"),
+                         server = conn$CONNECT_SERVER)#Sys.getenv("CONNECT_SERVER"))
 ```
 
 ## Background
 
-This document archives the steps taken to convert the SCI calculations from the original Family level master taxa list to an updated Genus level master taxa list. This step is critical to the continued improvement of data collection to ensure biologists have the appropriate taxonomic resolution available when entering data, as well as improves the process for identifying the target taxonomic level for a given taxa. Completing this step will allow for a smoother transition (on the database side) to a genus level SCI after it is approved. 
+This document archives the steps taken to convert the SCI calculations from the original Genus level master taxa list to an updated Genus level master taxa list. This step is critical to the continued improvement of data collection to ensure biologists have the appropriate taxonomic resolution available when entering data, as well as improves the process for identifying the target taxonomic level for a given taxa. Completing this step will allow for a smoother transition (on the database side) to a genus level SCI after it is approved. 
 
-Prior to this document, Drew Garey and Billy Van Wart manually QAed the existing Family level master taxa list. They updated taxonomic names to the most current naming protocols, expanded the taxonomic list to genus level where applicable (and indicated a target ID level), and updated habit/functional feeding group information to genus level. These changes were reviewed by the statewide biologists workgroup and then passed along to Emma Jones to update the SCI calculation methods with these improvements.
+Prior to this document, Drew Garey and Billy Van Wart manually QAed the existing Genus level master taxa list. They updated taxonomic names to the most current naming protocols, expanded the taxonomic list to species level where applicable (and indicated a target ID level), and updated habit/functional feeding group information to species level. These changes were reviewed by the statewide biologists workgroup and then passed along to Emma Jones to update the SCI calculation methods with these improvements.
 
 This document will implement the proposed changes to the master taxa list and verify the updates do not change the existing Family level SCI scores across all SCI methods. 
 
-### Family Level Master Taxa List Archive
+### Genus Level Master Taxa List Archive
 
-Before moving forward, we will preserve a snapshot of the existing Family Level master taxa list from ODS via the R server pin.
+Before moving forward, we will preserve a snapshot of the existing Genus Level master taxa list from ODS via the R server pin.
 
-```{r family master taxa list archive}
+```{r Genus master taxa list archive}
+masterTaxaListGenus <- pin_get('ejones/masterTaxaGenus', board = 'rsconnect')
+#saveRDS(masterTaxaListGenus, 'data/archive/masterTaxaGenus01032022.RDS')
+```
+
+### New Genus Level Master Taxa List
+
+This is the final version from Drew and Billy.
+
+```{r new genus master taxa list}
+masterTaxaListGenusNew <- read_excel('data/masterTaxaGenus_27Sept2021.xlsx', sheet = 'masterTaxaGenus') 
+# replace character NA with NA
+masterTaxaListGenusNew[masterTaxaListGenusNew == "NA"] <- NA
+glimpse(masterTaxaListGenusNew)
 
 ```
 
