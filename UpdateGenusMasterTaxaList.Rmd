@@ -58,10 +58,13 @@ masterTaxaListGenus <- pin_get('ejones/masterTaxaGenus', board = 'rsconnect')
 This is the final version from Drew and Billy.
 
 ```{r new genus master taxa list}
-masterTaxaListGenusNew <- read_excel('data/masterTaxaGenus_01112022.xlsx', sheet = 'masterTaxaGenus') %>% # Emma update
+masterTaxaListGenusNew <- read_excel('data/MasterTaxa_Genus/masterTaxaGenus_01132022.xlsx',
+                                     #masterTaxaGenus_01112022.xlsx', # Emma
+                                     #masterTaxaGenus_12Jan2022.xlsx',#Billy
+                                     sheet = 'masterTaxaGenus') %>% # Emma update
 
-  #read_excel('data/masterTaxaGenus_01062022.xlsx', sheet = 'masterTaxaGenus') %>% # Emma update
-  #read_excel('data/masterTaxaGenus_27Sept2021.xlsx', sheet = 'masterTaxaGenus') %>%  # original from Drew/Billy
+  #read_excel('data/MasterTaxa_Genus/masterTaxaGenus_01062022.xlsx', sheet = 'masterTaxaGenus') %>% # Emma update
+  #read_excel('data/MasterTaxa_Genus/masterTaxaGenus_27Sept2021.xlsx', sheet = 'masterTaxaGenus') %>%  # original from Drew/Billy
   mutate_at(c("FamTolVal", "TolVal", "GVSCI_TolVal"), as.numeric)
 # replace character NA with NA
 masterTaxaListGenusNew[masterTaxaListGenusNew == "NA"] <- NA
@@ -320,25 +323,28 @@ nrow(filter(comparison, difference !=0)) # 41 issues, not bad
 
 ```{r}
 # efficiently work through problems
-knownIssues <- filter(benthics, FinalID %in% c('Nixe', 'Plectrocnemia')) %>% 
+knownIssues <- filter(benthics, FinalID %in% c('Thremmatidae', 'Polycentropus (complex)')) %>% #'Nixe', 'Plectrocnemia')) %>% 
   distinct(BenSampID) %>% pull()
 View(
 filter(comparison, difference !=0) %>% 
-  filter(BenSampID %in% knownIssues))
+  filter( BenSampID %in% knownIssues))
 ```
 
 
 ```{r}
 benSamps1 <- benSamps
 
-sampleID <- "LEV19577R110"
+sampleID <- "LRO4025R110" #Polycentropus/Cernotina
+  
+  #"FAMMEY4448" #Thremmatidae
+#  "LEV19577R110"
 #'LIV8493R110' #Nixe
 #'XMJ19555R110' #Plectrocnemia
 #'GOO8492'  #Nixe
 #'GOO8492R110' #Nixe
 
-stationBenthicsDateRange<- filter(benthicsNew, BenSampID %in% sampleID) 
-#stationBenthicsDateRange<- filter(benthics, BenSampID %in% sampleID) 
+#stationBenthicsDateRange<- filter(benthicsNew, BenSampID %in% sampleID) 
+stationBenthicsDateRange<- filter(benthics, BenSampID %in% sampleID) 
 SCIchoice <- "VSCI"
 benSamps <- filter(benSamps1, BenSampID %in% sampleID) 
 #masterTaxaGenus, vmast, benSamps, masterTaxaGenus, vmast
@@ -633,5 +639,60 @@ Last QA check, any taxa in the benthics table that are not in the new master tax
 
 ```{r all missing taxa}
 unique(benthics$FinalID)[! unique(benthics$FinalID) %in% masterTaxaListGenusNew$FinalID]
+```
+
+And compare new master taxa list with Billy's commented up version to make sure no tolval, habit, etc. missed in mine
+
+
+```{r}
+masterTaxaListGenusNew <- read_excel('data/MasterTaxa_Genus/masterTaxaGenus_01132022.xlsx',
+                                     #masterTaxaGenus_01112022.xlsx', # Emma
+                                     #masterTaxaGenus_12Jan2022.xlsx',#Billy
+                                     sheet = 'masterTaxaGenus') %>% # Emma update
+
+  #read_excel('data/MasterTaxa_Genus/masterTaxaGenus_01062022.xlsx', sheet = 'masterTaxaGenus') %>% # Emma update
+  #read_excel('data/MasterTaxa_Genus/masterTaxaGenus_27Sept2021.xlsx', sheet = 'masterTaxaGenus') %>%  # original from Drew/Billy
+  mutate_at(c("FamTolVal", "TolVal", "GVSCI_TolVal"), as.numeric)
+# replace character NA with NA
+masterTaxaListGenusNew[masterTaxaListGenusNew == "NA"] <- NA
+masterTaxaListGenusNew <- masterTaxaListGenusNew %>% 
+   mutate(Source = 'Emma')
+
+masterTaxaListGenusNewBilly <- read_excel('data/MasterTaxa_Genus/masterTaxaGenus_12Jan2022.xlsx',#Billy
+                                     sheet = 'masterTaxaGenus') %>% 
+  mutate_at(c("FamTolVal", "TolVal", "GVSCI_TolVal"), as.numeric) %>% 
+  mutate(Source = 'Billy')
+# replace character NA with NA
+masterTaxaListGenusNewBilly[masterTaxaListGenusNewBilly == "NA"] <- NA
+
+
+
+mtaxaComp <- full_join(masterTaxaListGenusNew, masterTaxaListGenusNewBilly, 
+                       by = c("Phylum", "Class", "Subclass", "Order", "Suborder",
+                              "Superfamily", "Family", "Subfamily", "Tribe", "Genus", 
+                              "Species", "Final VA Family ID", "FamFFG", "FamTolVal", 
+                              "FamHabit", "FinalID", "OldFinalID", "TolVal", "FFG", "Habit",
+                              "Autecology comments", "Target", "GVSCI_FinalID", "GVSCI_TolVal", 
+                              "GVSCI_FFG", "GVSCI_Habit", "Final_Actions", "Comments", "New_designation")) %>% 
+  group_by(FinalID) %>% 
+  mutate(n = n()) %>% 
+  filter(n > 1) %>% 
+  arrange(FinalID)
+
+write.csv(mtaxaComp, 'data/MasterTaxa_Genus/mtaxaComp.csv', row.names = F, na = '')
+```
+
+
+
+## WQX comparison
+
+This section compares the WQX query from Roger vs new master taxa list
+
+```{r}
+wqx <- readxl::read_excel('data/MasterTaxa_Genus/WQX_Domain_Values_taxa_20200407.xlsx')
+
+differences <- filter(masterTaxaListGenusNew, ! FinalID %in% wqx$Name)
+write.csv(differences, 'data/MasterTaxa_Genus/WQXdifferences.csv', row.names = F, na = '')
+
 ```
 
